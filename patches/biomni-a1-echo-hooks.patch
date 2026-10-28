@@ -1,0 +1,700 @@
+diff --git a/biomni/agent/a1.py b/biomni/agent/a1.py
+index 7a62e59..1ffea66 100644
+--- a/biomni/agent/a1.py
++++ b/biomni/agent/a1.py
+@@ -6,6 +6,7 @@ from collections.abc import Generator
+ from datetime import datetime
+ from pathlib import Path
+ from typing import Any, Literal, TypedDict
++from uuid import uuid4
+
+ import pandas as pd
+ from dotenv import load_dotenv
+@@ -222,6 +223,60 @@ class A1:
+         self.timeout_seconds = timeout_seconds  # 10 minutes default timeout
+         self.configure()
+
++    # The following methods are deliberately identity/no-op extension seams.  They
++    # keep Biomni independent from any harness implementation while allowing an
++    # adapter (for example Echo-Bio) to observe or project requests and raw tool
++    # results.  Subclasses must fail open to these baseline values.
++    def _on_run_start(self, run_identity: dict[str, str], prompt: str) -> None:
++        pass
++
++    def _before_model_request(self, messages: list[BaseMessage]) -> list[BaseMessage]:
++        return messages
++
++    def _after_model_response(self, response: Any, requested_messages: list[BaseMessage]) -> None:
++        pass
++
++    def _before_execution(self, code: str, language: str) -> str:
++        return code
++
++    def _after_execution(self, code: str, language: str, raw_result: str) -> str:
++        """Observe a full result before Biomni applies its 10K projection."""
++        return raw_result
++
++    def _project_execution_result(self, result: str) -> str:
++        """Apply Biomni's legacy provider-visible observation projection."""
++        if len(result) > 10000:
++            return (
++                "The output is too long to be added to context. Here are the first 10K characters...\n"
++                + result[:10000]
++            )
++        return result
++
++    def _before_finalize(self, content: str) -> str:
++        return content
++
++    def _on_run_end(self, run_identity: dict[str, str], status: str, final_content: str | None) -> None:
++        pass
++
++    def _new_run_identity(
++        self,
++        *,
++        run_id: str | None = None,
++        attempt_id: str | None = None,
++        session_id: str | None = None,
++    ) -> dict[str, str]:
++        """Create the run/attempt/session identity used by the LangGraph thread."""
++        identity = {
++            "run_id": run_id or str(uuid4()),
++            "attempt_id": attempt_id or str(uuid4()),
++            "session_id": session_id or str(uuid4()),
++        }
++        self.run_identity = identity
++        # The Python REPL is currently process-global.  Recording its owner makes
++        # that limitation explicit without changing baseline persistence semantics.
++        self.python_namespace_owner_attempt_id = identity["attempt_id"]
++        return identity
++
+     def add_tool(self, api):
+         """Add a new tool to the agent's tool registry and make it available for retrieval.
+
+@@ -1286,6 +1341,195 @@ Each library is listed with its description to help you understand its functiona
+
+         return formatted_prompt
+
++    def _generate_node(self, state: AgentState) -> AgentState:
++        """Generate the next agent message while preserving Biomni's parsing semantics."""
++        system_prompt = self.system_prompt
++        if hasattr(self.llm, "model_name") and (
++            "gpt" in str(self.llm.model_name).lower() or "openai" in str(type(self.llm)).lower()
++        ):
++            system_prompt += "\n\nIMPORTANT FOR GPT MODELS: You MUST use XML tags <execute> or <solution> in EVERY response. Do not use markdown code blocks (```) - use <execute> tags instead."
++
++        baseline_messages = [SystemMessage(content=system_prompt)] + state["messages"]
++        messages = self._before_model_request(baseline_messages)
++        response = self.llm.invoke(messages)
++        self._after_model_response(response, messages)
++
++        # Normalize Responses API content blocks (list of dicts) into a plain string.
++        content = response.content
++        if isinstance(content, list):
++            text_parts: list[str] = []
++            for block in content:
++                try:
++                    if isinstance(block, dict):
++                        btype = block.get("type")
++                        if btype in ("text", "output_text", "redacted_text"):
++                            part = block.get("text") or block.get("content") or ""
++                            if isinstance(part, str):
++                                text_parts.append(part)
++                except Exception:
++                    continue
++            msg = "".join(text_parts)
++        else:
++            msg = str(content)
++
++        if "<execute>" in msg and "</execute>" not in msg:
++            msg += "</execute>"
++        if "<solution>" in msg and "</solution>" not in msg:
++            msg += "</solution>"
++        if "<think>" in msg and "</think>" not in msg:
++            msg += "</think>"
++
++        think_match = re.search(r"<think>(.*?)</think>", msg, re.DOTALL | re.IGNORECASE)
++        execute_match = re.search(r"<execute>(.*?)</execute>", msg, re.DOTALL | re.IGNORECASE)
++        answer_match = re.search(r"<solution>(.*?)</solution>", msg, re.DOTALL | re.IGNORECASE)
++
++        if not execute_match:
++            code_block_match = re.search(r"```(?:python|bash|r)?\s*(.*?)```", msg, re.DOTALL)
++            if code_block_match and not answer_match:
++                execute_match = code_block_match
++
++        if answer_match:
++            msg = self._before_finalize(msg)
++
++        state["messages"].append(AIMessage(content=msg.strip()))
++
++        if answer_match:
++            state["next_step"] = "end"
++        elif execute_match:
++            state["next_step"] = "execute"
++        elif think_match:
++            state["next_step"] = "generate"
++        else:
++            print("parsing error...")
++            error_count = sum(
++                1
++                for message in state["messages"]
++                if isinstance(message, AIMessage) and "There are no tags" in message.content
++            )
++            if error_count >= 2:
++                print("Detected repeated parsing errors, ending conversation")
++                state["next_step"] = "end"
++                state["messages"].append(
++                    AIMessage(
++                        content="Execution terminated due to repeated parsing errors. Please check your input and try again."
++                    )
++                )
++            else:
++                state["messages"].append(
++                    HumanMessage(
++                        content="Each response must include thinking process followed by either <execute> or <solution> tag. But there are no tags in the current response. Please follow the instruction, fix and regenerate the response again."
++                    )
++                )
++                state["next_step"] = "generate"
++        return state
++
++    @staticmethod
++    def _execution_language(code: str) -> Literal["python", "r", "bash", "cli"]:
++        stripped = code.strip()
++        if stripped.startswith(("#!R", "# R code", "# R script")):
++            return "r"
++        if stripped.startswith("#!CLI"):
++            return "cli"
++        if stripped.startswith(("#!BASH", "# Bash script")):
++            return "bash"
++        return "python"
++
++    def _execute_node(self, state: AgentState) -> AgentState:
++        """Execute code and expose the untruncated result through the harness seam."""
++        last_message = state["messages"][-1].content
++        if "<execute>" in last_message and "</execute>" not in last_message:
++            last_message += "</execute>"
++
++        execute_match = re.search(r"<execute>(.*?)</execute>", last_message, re.DOTALL)
++        if not execute_match:
++            return state
++
++        code = execute_match.group(1)
++        language = self._execution_language(code)
++        code = self._before_execution(code, language)
++        # A projecting hook may alter an execution marker, so classify once more.
++        language = self._execution_language(code)
++        timeout = self.timeout_seconds
++
++        if language == "r":
++            r_code = re.sub(r"^#!R|^# R code|^# R script", "", code, count=1).strip()
++            result = run_with_timeout(run_r_code, [r_code], timeout=timeout)
++        elif language in ("bash", "cli"):
++            if language == "cli":
++                cli_command = re.sub(r"^#!CLI", "", code, count=1).strip().replace("\n", " ")
++                result = run_with_timeout(run_bash_script, [cli_command], timeout=timeout)
++            else:
++                bash_script = re.sub(r"^#!BASH|^# Bash script", "", code, count=1).strip()
++                result = run_with_timeout(run_bash_script, [bash_script], timeout=timeout)
++        else:
++            self._clear_execution_plots()
++            self._inject_custom_functions_to_repl()
++            result = run_with_timeout(run_python_repl, [code], timeout=timeout)
++
++        # This is intentionally before the legacy 10K provider projection.
++        result = self._after_execution(code, language, result)
++        result = self._project_execution_result(result)
++
++        if not hasattr(self, "_execution_results"):
++            self._execution_results = []
++
++        execution_plots = []
++        try:
++            from biomni.tool.support_tools import get_captured_plots
++
++            current_plots = get_captured_plots()
++            execution_plots = current_plots.copy()
++        except Exception as error:
++            print(f"Warning: Could not capture plots from execution: {error}")
++
++        self._execution_results.append(
++            {
++                "triggering_message": last_message,
++                "images": execution_plots,
++                "timestamp": datetime.now().isoformat(),
++            }
++        )
++        observation = f"\n<observation>{result}</observation>"
++        state["messages"].append(AIMessage(content=observation.strip()))
++        return state
++
++    @staticmethod
++    def _routing_function(state: AgentState) -> Literal["execute", "generate", "end"]:
++        next_step = state.get("next_step")
++        if next_step in ("execute", "generate", "end"):
++            return next_step
++        raise ValueError(f"Unexpected next_step: {next_step}")
++
++    @staticmethod
++    def _routing_function_self_critic(state: AgentState) -> Literal["generate", "end"]:
++        next_step = state.get("next_step")
++        if next_step in ("generate", "end"):
++            return next_step
++        raise ValueError(f"Unexpected next_step: {next_step}")
++
++    def _self_critic_node(self, state: AgentState) -> AgentState:
++        if self.critic_count < self.test_time_scale_round:
++            messages = state["messages"]
++            feedback_prompt = f"""
++                Here is a reminder of what is the user requested: {self.user_task}
++                Examine the previous executions, reaosning, and solutions.
++                Critic harshly on what could be improved?
++                Be specific and constructive.
++                Think hard what are missing to solve the task.
++                No question asked, just feedbacks.
++                """
++            feedback = self.llm.invoke(messages + [HumanMessage(content=feedback_prompt)])
++            state["messages"].append(
++                HumanMessage(
++                    content=f"Wait... this is not enough to solve the task. Here are some feedbacks for improvement:\n{feedback.content}"
++                )
++            )
++            self.critic_count += 1
++            state["next_step"] = "generate"
++        else:
++            state["next_step"] = "end"
++        return state
++
+     def configure(self, self_critic=False, test_time_scale_round=0):
+         """Configure the agent with the initial system prompt and workflow.
+
+@@ -1296,6 +1540,7 @@ Each library is listed with its description to help you understand its functiona
+         """
+         # Store self_critic for later use
+         self.self_critic = self_critic
++        self.test_time_scale_round = test_time_scale_round
+
+         # Get data lake content
+         data_lake_path = self.path + "/data_lake"
+@@ -1377,245 +1622,21 @@ Each library is listed with its description to help you understand its functiona
+             know_how_docs=know_how_docs if know_how_docs else None,
+         )
+
+-        # Define the nodes
+-        def generate(state: AgentState) -> AgentState:
+-            # Add OpenAI-specific formatting reminders if using OpenAI models
+-            system_prompt = self.system_prompt
+-            if hasattr(self.llm, "model_name") and (
+-                "gpt" in str(self.llm.model_name).lower() or "openai" in str(type(self.llm)).lower()
+-            ):
+-                system_prompt += "\n\nIMPORTANT FOR GPT MODELS: You MUST use XML tags <execute> or <solution> in EVERY response. Do not use markdown code blocks (```) - use <execute> tags instead."
+-
+-            messages = [SystemMessage(content=system_prompt)] + state["messages"]
+-            response = self.llm.invoke(messages)
+-
+-            # Normalize Responses API content blocks (list of dicts) into a plain string
+-            content = response.content
+-            if isinstance(content, list):
+-                # Concatenate textual parts; ignore tool_use or other non-text blocks
+-                text_parts: list[str] = []
+-                for block in content:
+-                    try:
+-                        if isinstance(block, dict):
+-                            btype = block.get("type")
+-                            if btype in ("text", "output_text", "redacted_text"):
+-                                part = block.get("text") or block.get("content") or ""
+-                                if isinstance(part, str):
+-                                    text_parts.append(part)
+-                    except Exception:
+-                        # Be conservative; skip malformed blocks
+-                        continue
+-                msg = "".join(text_parts)
+-            else:
+-                # Fallback to string conversion for legacy content
+-                msg = str(content)
+-
+-            # Enhanced parsing for better OpenAI compatibility
+-            # Check for incomplete tags and fix them
+-            if "<execute>" in msg and "</execute>" not in msg:
+-                msg += "</execute>"
+-            if "<solution>" in msg and "</solution>" not in msg:
+-                msg += "</solution>"
+-            if "<think>" in msg and "</think>" not in msg:
+-                msg += "</think>"
+-
+-            # More flexible pattern matching for different LLM styles
+-            think_match = re.search(r"<think>(.*?)</think>", msg, re.DOTALL | re.IGNORECASE)
+-            execute_match = re.search(r"<execute>(.*?)</execute>", msg, re.DOTALL | re.IGNORECASE)
+-            answer_match = re.search(r"<solution>(.*?)</solution>", msg, re.DOTALL | re.IGNORECASE)
+-
+-            # Alternative patterns for OpenAI models that might use different formatting
+-            if not execute_match:
+-                # Try to find code blocks that might be intended as execute blocks
+-                code_block_match = re.search(r"```(?:python|bash|r)?\s*(.*?)```", msg, re.DOTALL)
+-                if code_block_match and not answer_match:
+-                    # If we found a code block and no solution, treat it as execute
+-                    execute_match = code_block_match
+-
+-            # Add the message to the state before checking for errors
+-            state["messages"].append(AIMessage(content=msg.strip()))
+-
+-            if answer_match:
+-                state["next_step"] = "end"
+-            elif execute_match:
+-                state["next_step"] = "execute"
+-            elif think_match:
+-                state["next_step"] = "generate"
+-            else:
+-                print("parsing error...")
+-
+-                error_count = sum(
+-                    1 for m in state["messages"] if isinstance(m, AIMessage) and "There are no tags" in m.content
+-                )
+-
+-                if error_count >= 2:
+-                    # If we've already tried to correct the model twice, just end the conversation
+-                    print("Detected repeated parsing errors, ending conversation")
+-                    state["next_step"] = "end"
+-                    # Add a final message explaining the termination
+-                    state["messages"].append(
+-                        AIMessage(
+-                            content="Execution terminated due to repeated parsing errors. Please check your input and try again."
+-                        )
+-                    )
+-                else:
+-                    # Try to correct it
+-                    state["messages"].append(
+-                        HumanMessage(
+-                            content="Each response must include thinking process followed by either <execute> or <solution> tag. But there are no tags in the current response. Please follow the instruction, fix and regenerate the response again."
+-                        )
+-                    )
+-                    state["next_step"] = "generate"
+-            return state
+-
+-        def execute(state: AgentState) -> AgentState:
+-            last_message = state["messages"][-1].content
+-            # Only add the closing tag if it's not already there
+-            if "<execute>" in last_message and "</execute>" not in last_message:
+-                last_message += "</execute>"
+-
+-            execute_match = re.search(r"<execute>(.*?)</execute>", last_message, re.DOTALL)
+-            if execute_match:
+-                code = execute_match.group(1)
+-
+-                # Set timeout duration (10 minutes = 600 seconds)
+-                timeout = self.timeout_seconds
+-
+-                # Check if the code is R code
+-                if (
+-                    code.strip().startswith("#!R")
+-                    or code.strip().startswith("# R code")
+-                    or code.strip().startswith("# R script")
+-                ):
+-                    # Remove the R marker and run as R code
+-                    r_code = re.sub(r"^#!R|^# R code|^# R script", "", code, count=1).strip()
+-                    result = run_with_timeout(run_r_code, [r_code], timeout=timeout)
+-                # Check if the code is a Bash script or CLI command
+-                elif (
+-                    code.strip().startswith("#!BASH")
+-                    or code.strip().startswith("# Bash script")
+-                    or code.strip().startswith("#!CLI")
+-                ):
+-                    # Handle both Bash scripts and CLI commands with the same function
+-                    if code.strip().startswith("#!CLI"):
+-                        # For CLI commands, extract the command and run it as a simple bash script
+-                        cli_command = re.sub(r"^#!CLI", "", code, count=1).strip()
+-                        # Remove any newlines to ensure it's a single command
+-                        cli_command = cli_command.replace("\n", " ")
+-                        result = run_with_timeout(run_bash_script, [cli_command], timeout=timeout)
+-                    else:
+-                        # For Bash scripts, remove the marker and run as a bash script
+-                        bash_script = re.sub(r"^#!BASH|^# Bash script", "", code, count=1).strip()
+-                        result = run_with_timeout(run_bash_script, [bash_script], timeout=timeout)
+-                # Otherwise, run as Python code
+-                else:
+-                    # Clear any previous plots before execution
+-                    self._clear_execution_plots()
+-
+-                    # Inject custom functions into the Python execution environment
+-                    self._inject_custom_functions_to_repl()
+-                    result = run_with_timeout(run_python_repl, [code], timeout=timeout)
+-
+-                    # Plots are now captured directly in the execution entry above
+-
+-                if len(result) > 10000:
+-                    result = (
+-                        "The output is too long to be added to context. Here are the first 10K characters...\n"
+-                        + result[:10000]
+-                    )
+-
+-                # Store the execution result with the triggering message
+-                if not hasattr(self, "_execution_results"):
+-                    self._execution_results = []
+-
+-                # Get any plots that were generated during this execution
+-                execution_plots = []
+-                try:
+-                    from biomni.tool.support_tools import get_captured_plots
+-
+-                    current_plots = get_captured_plots()
+-                    execution_plots = current_plots.copy()
+-                except Exception as e:
+-                    print(f"Warning: Could not capture plots from execution: {e}")
+-                    execution_plots = []
+-
+-                # Store the execution result with metadata
+-                execution_entry = {
+-                    "triggering_message": last_message,  # The AI message that contained <execute>
+-                    "images": execution_plots,  # Base64 encoded images from this execution
+-                    "timestamp": datetime.now().isoformat(),
+-                }
+-                self._execution_results.append(execution_entry)
+-
+-                observation = f"\n<observation>{result}</observation>"
+-                state["messages"].append(AIMessage(content=observation.strip()))
+-
+-            return state
+-
+-        def routing_function(
+-            state: AgentState,
+-        ) -> Literal["execute", "generate", "end"]:
+-            next_step = state.get("next_step")
+-            if next_step == "execute":
+-                return "execute"
+-            elif next_step == "generate":
+-                return "generate"
+-            elif next_step == "end":
+-                return "end"
+-            else:
+-                raise ValueError(f"Unexpected next_step: {next_step}")
+-
+-        def routing_function_self_critic(
+-            state: AgentState,
+-        ) -> Literal["generate", "end"]:
+-            next_step = state.get("next_step")
+-            if next_step == "generate":
+-                return "generate"
+-            elif next_step == "end":
+-                return "end"
+-            else:
+-                raise ValueError(f"Unexpected next_step: {next_step}")
+-
+-        def execute_self_critic(state: AgentState) -> AgentState:
+-            if self.critic_count < test_time_scale_round:
+-                # Generate feedback based on message history
+-                messages = state["messages"]
+-                feedback_prompt = f"""
+-                Here is a reminder of what is the user requested: {self.user_task}
+-                Examine the previous executions, reaosning, and solutions.
+-                Critic harshly on what could be improved?
+-                Be specific and constructive.
+-                Think hard what are missing to solve the task.
+-                No question asked, just feedbacks.
+-                """
+-                feedback = self.llm.invoke(messages + [HumanMessage(content=feedback_prompt)])
+-
+-                # Add feedback as a new message
+-                state["messages"].append(
+-                    HumanMessage(
+-                        content=f"Wait... this is not enough to solve the task. Here are some feedbacks for improvement:\n{feedback.content}"
+-                    )
+-                )
+-                self.critic_count += 1
+-                state["next_step"] = "generate"
+-            else:
+-                state["next_step"] = "end"
+-
+-            return state
+-
++        # Build the graph from class-level nodes so adapters can override the
++        # harness boundary without replacing configure().
+         # Create the workflow
+         workflow = StateGraph(AgentState)
+
+         # Add nodes
+-        workflow.add_node("generate", generate)
+-        workflow.add_node("execute", execute)
++        workflow.add_node("generate", self._generate_node)
++        workflow.add_node("execute", self._execute_node)
+
+         if self_critic:
+-            workflow.add_node("self_critic", execute_self_critic)
++            workflow.add_node("self_critic", self._self_critic_node)
+             # Add conditional edges
+             workflow.add_conditional_edges(
+                 "generate",
+-                routing_function,
++                self._routing_function,
+                 path_map={
+                     "execute": "execute",
+                     "generate": "generate",
+@@ -1624,14 +1645,14 @@ Each library is listed with its description to help you understand its functiona
+             )
+             workflow.add_conditional_edges(
+                 "self_critic",
+-                routing_function_self_critic,
++                self._routing_function_self_critic,
+                 path_map={"generate": "generate", "end": END},
+             )
+         else:
+             # Add conditional edges
+             workflow.add_conditional_edges(
+                 "generate",
+-                routing_function,
++                self._routing_function,
+                 path_map={"execute": "execute", "generate": "generate", "end": END},
+             )
+         workflow.add_edge("execute", "generate")
+@@ -1756,39 +1777,57 @@ Each library is listed with its description to help you understand its functiona
+
+         return selected_resources_names
+
+-    def go(self, prompt):
++    def go(
++        self,
++        prompt,
++        *,
++        run_id: str | None = None,
++        attempt_id: str | None = None,
++        session_id: str | None = None,
++    ):
+         """Execute the agent with the given prompt.
+
+         Args:
+             prompt: The user's query
+
+         """
++        identity = self._new_run_identity(run_id=run_id, attempt_id=attempt_id, session_id=session_id)
+         self.critic_count = 0
+         self.user_task = prompt
+-
+-        if self.use_tool_retriever:
+-            selected_resources_names = self._prepare_resources_for_retrieval(prompt)
+-            self.update_system_prompt_with_selected_resources(selected_resources_names)
+-
+-        inputs = {"messages": [HumanMessage(content=prompt)], "next_step": None}
+-        config = {"recursion_limit": 500, "configurable": {"thread_id": 42}}
+         self.log = []
+-
+-        # Store the final conversation state for markdown generation
+         final_state = None
++        final_content = None
++        status = "failed"
++        self._on_run_start(identity, prompt)
++        try:
++            if self.use_tool_retriever:
++                selected_resources_names = self._prepare_resources_for_retrieval(prompt)
++                self.update_system_prompt_with_selected_resources(selected_resources_names)
+
+-        for s in self.app.stream(inputs, stream_mode="values", config=config):
+-            message = s["messages"][-1]
+-            out = pretty_print(message)
+-            self.log.append(out)
+-            final_state = s  # Store the latest state
++            inputs = {"messages": [HumanMessage(content=prompt)], "next_step": None}
++            config = {"recursion_limit": 500, "configurable": {"thread_id": identity["session_id"]}}
+
+-        # Store the conversation state for markdown generation
+-        self._conversation_state = final_state
++            for state in self.app.stream(inputs, stream_mode="values", config=config):
++                message = state["messages"][-1]
++                out = pretty_print(message)
++                self.log.append(out)
++                final_state = state
++                final_content = message.content
+
+-        return self.log, message.content
++            status = "completed"
++            return self.log, final_content
++        finally:
++            self._conversation_state = final_state
++            self._on_run_end(identity, status, final_content)
+
+-    def go_stream(self, prompt) -> Generator[dict, None, None]:
++    def go_stream(
++        self,
++        prompt,
++        *,
++        run_id: str | None = None,
++        attempt_id: str | None = None,
++        session_id: str | None = None,
++    ) -> Generator[dict, None, None]:
+         """Execute the agent with the given prompt and return a generator that yields each step.
+
+         This function returns a generator that yields each step of the agent's execution,
+@@ -1800,31 +1839,36 @@ Each library is listed with its description to help you understand its functiona
+         Yields:
+             dict: Each step of the agent's execution containing the current message and state
+         """
++        identity = self._new_run_identity(run_id=run_id, attempt_id=attempt_id, session_id=session_id)
+         self.critic_count = 0
+         self.user_task = prompt
+-
+-        if self.use_tool_retriever:
+-            selected_resources_names = self._prepare_resources_for_retrieval(prompt)
+-            self.update_system_prompt_with_selected_resources(selected_resources_names)
+-
+-        inputs = {"messages": [HumanMessage(content=prompt)], "next_step": None}
+-        config = {"recursion_limit": 500, "configurable": {"thread_id": 42}}
+         self.log = []
+-
+-        # Store the final conversation state for markdown generation
+         final_state = None
+-
+-        for s in self.app.stream(inputs, stream_mode="values", config=config):
+-            message = s["messages"][-1]
+-            out = pretty_print(message)
+-            self.log.append(out)
+-            final_state = s  # Store the latest state
+-
+-            # Yield the current step
+-            yield {"output": out}
+-
+-        # Store the conversation state for markdown generation
+-        self._conversation_state = final_state
++        final_content = None
++        status = "cancelled"
++        self._on_run_start(identity, prompt)
++        try:
++            if self.use_tool_retriever:
++                selected_resources_names = self._prepare_resources_for_retrieval(prompt)
++                self.update_system_prompt_with_selected_resources(selected_resources_names)
++
++            inputs = {"messages": [HumanMessage(content=prompt)], "next_step": None}
++            config = {"recursion_limit": 500, "configurable": {"thread_id": identity["session_id"]}}
++
++            for state in self.app.stream(inputs, stream_mode="values", config=config):
++                message = state["messages"][-1]
++                out = pretty_print(message)
++                self.log.append(out)
++                final_state = state
++                final_content = message.content
++                yield {"output": out}
++            status = "completed"
++        except Exception:
++            status = "failed"
++            raise
++        finally:
++            self._conversation_state = final_state
++            self._on_run_end(identity, status, final_content)
+
+     def update_system_prompt_with_selected_resources(self, selected_resources):
+         """Update the system prompt with the selected resources."""
+@@ -2624,7 +2668,7 @@ Each library is listed with its description to help you understand its functiona
+
+             return wrapper
+
+-    def launch_gradio_demo(self, thread_id=42, share=False, server_name="0.0.0.0", require_verification=False):
++    def launch_gradio_demo(self, thread_id=None, share=False, server_name="0.0.0.0", require_verification=False):
+         """Launch a full-featured Gradio UI for the A1 agent (adapted from codeact_copilot).
+
+         Args:
+@@ -2646,6 +2690,9 @@ Each library is listed with its description to help you understand its functiona
+         import os
+         from time import time
+
++        if thread_id is None:
++            thread_id = str(uuid4())
++
+         # Define supported file extensions
+         SUPPORTED_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".pdf")
+

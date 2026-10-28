@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "echo-bio"
+version = "0.1.0rc1"
+description = "Evidence-constrained harness optimization for biomedical research agents"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["h5py>=3.12,<4", "pydantic>=2.10,<3", "tiktoken>=0.8,<1"]
+
+[project.scripts]
+echo-bio = "echo_bio.cli:main"
+
+[project.optional-dependencies]
+biomni = [
+  "langchain-core>=0.3,<2",
+  "langchain-openai>=0.3,<2",
+  "langgraph>=0.2,<2",
+  "pandas>=2.2,<4",
+  "python-dotenv>=1,<2",
+  "requests>=2.32,<3",
+  "tqdm>=4.67,<5",
+]
+dev = ["pytest>=8.3,<9", "pytest-cov>=6,<8", "ruff>=0.9,<1"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers"
+testpaths = ["tests"]
+pythonpath = [".", "src", "../src/Biomni"]
+markers = [
+  "biomni: contract tests against the frozen Biomni source tree",
+  "performance: local overhead measurements with broad host-dependent bounds",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "C4"]
